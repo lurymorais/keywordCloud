@@ -15,10 +15,9 @@
 namespace APP\plugins\blocks\keywordCloud;
 
 use APP\core\Application;
-use APP\facades\Repo;
-use APP\plugins\blocks\keywordCloud\classes\KeywordCounter;
 use APP\submission\Submission;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use PKP\context\Context;
 use PKP\controlledVocab\ControlledVocab;
 use PKP\facades\Locale;
@@ -28,8 +27,6 @@ class KeywordCloudBlockPlugin extends BlockPlugin
 {
     private const KEYWORD_BLOCK_MAX_ITEMS = 50;
     private const KEYWORD_BLOCK_CACHE_DAYS = 2;
-    private const ONE_DAY_SECONDS = 60 * 60 * 24;
-    private const TWO_DAYS_SECONDS = self::ONE_DAY_SECONDS * self::KEYWORD_BLOCK_CACHE_DAYS;
 
     public function getDisplayName(): string
     {
@@ -88,30 +85,58 @@ class KeywordCloudBlockPlugin extends BlockPlugin
 
     private function getJournalKeywords(int $journalId, string $locale): string
     {
-        $publicationIds = Repo::publication()
-            ->getCollector()
-            ->filterByContextIds([$journalId])
-            ->getQueryBuilder()
-            ->whereIn('p.status', [Submission::STATUS_PUBLISHED])
-            ->select('p.publication_id')
-            ->pluck('p.publication_id');
-
-        $keywordCounter = new KeywordCounter();
-        foreach ($publicationIds as $publicationId) {
-            $publicationKeywords = Repo::controlledVocab()->getBySymbolic(
-                ControlledVocab::CONTROLLED_VOCAB_SUBMISSION_KEYWORD,
-                Application::ASSOC_TYPE_PUBLICATION,
-                $publicationId,
-                [$locale]
-            );
-            $keywordCounter->addPublication($publicationKeywords[$locale] ?? []);
+        try {
+            $rows = DB::table('controlled_vocabs as cv')
+                ->join(
+                    'controlled_vocab_entries as cve',
+                    'cve.controlled_vocab_id',
+                    '=',
+                    'cv.controlled_vocab_id'
+                )
+                ->join(
+                    'controlled_vocab_entry_settings as cves',
+                    'cves.controlled_vocab_entry_id',
+                    '=',
+                    'cve.controlled_vocab_entry_id'
+                )
+                ->join('publications as p', 'p.publication_id', '=', 'cv.assoc_id')
+                ->join('submissions as s', 's.submission_id', '=', 'p.submission_id')
+                ->where('cv.symbolic', ControlledVocab::CONTROLLED_VOCAB_SUBMISSION_KEYWORD)
+                ->where('cv.assoc_type', Application::ASSOC_TYPE_PUBLICATION)
+                ->where('s.context_id', $journalId)
+                ->where('s.status', Submission::STATUS_PUBLISHED)
+                ->where('cves.locale', $locale)
+                ->where('cves.setting_name', 'name')
+                ->pluck('cves.setting_value')
+                ->toArray();
+        } catch (\Throwable $e) {
+            error_log('KeywordCloud query error: ' . $e->getMessage());
+            return '[]';
         }
 
-        $topKeywords = $keywordCounter->getMostFrequent(self::KEYWORD_BLOCK_MAX_ITEMS);
-        $keywords = [];
+        if (empty($rows)) {
+            return '[]';
+        }
 
-        foreach ($topKeywords as $key => $countKey) {
-            $keywords[] = (object) ['text' => $key, 'size' => $countKey];
+        $counts = [];
+        foreach ($rows as $keyword) {
+            $normalized = strtolower(trim((string) $keyword));
+            if ($normalized === '') {
+                continue;
+            }
+            $counts[$normalized] = ($counts[$normalized] ?? 0) + 1;
+        }
+
+        if (empty($counts)) {
+            return '[]';
+        }
+
+        arsort($counts, SORT_NUMERIC);
+        $topKeywords = array_slice($counts, 0, self::KEYWORD_BLOCK_MAX_ITEMS, true);
+
+        $keywords = [];
+        foreach ($topKeywords as $text => $size) {
+            $keywords[] = (object) ['text' => $text, 'size' => $size];
         }
 
         return json_encode($keywords);
@@ -119,5 +144,8 @@ class KeywordCloudBlockPlugin extends BlockPlugin
 }
 
 if (!PKP_STRICT_MODE) {
-    class_alias('\APP\plugins\blocks\keywordCloud\KeywordCloudBlockPlugin', '\KeywordCloudBlockPlugin');
+    class_alias(
+        '\APP\plugins\blocks\keywordCloud\KeywordCloudBlockPlugin',
+        '\KeywordCloudBlockPlugin'
+    );
 }
